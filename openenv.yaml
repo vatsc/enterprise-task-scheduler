@@ -1,0 +1,29 @@
+name: enterprise-task-scheduler
+version: "1.0.0"
+description: >
+  Enterprise Task Dependency Scheduler — an OpenEnv environment where an AI agent
+  schedules dependent tasks across multiple workers (CPU cores) to minimize total
+  execution time (makespan). Features complex dependency graphs, contention points,
+  and a deterministic grader scoring 0.0-1.0 based on optimal vs agent performance.
+
+tasks:
+  - name: easy
+    description: "Fork-join DAG with 3 branches and 2 workers. 7 tasks."
+  - name: medium
+    description: "Two-stage contention with 3 branches and 2 workers. 9 tasks."
+  - name: hard
+    description: "Multi-phase CI/CD pipeline with 14 tasks and 3 workers."
+
+endpoints:
+  # Standard OpenEnv API
+  reset: /reset
+  step: /step
+  state: /state
+  # Custom endpoints (required by hackathon spec)
+  grader: /grader
+  baseline: /baseline
+  tasks: /tasks
+
+server:
+  port: 8000
+  host: "0.0.0.0"

@@ -1,0 +1,21 @@
+[project]
+name = "enterprise-task-scheduler"
+version = "1.0.0"
+description = "An OpenEnv environment for scheduling dependent tasks across multiple workers"
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.24.0",
+    "pytest>=7.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
