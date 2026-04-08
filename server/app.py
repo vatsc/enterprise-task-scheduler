@@ -94,14 +94,14 @@ async def reset(request: ResetRequest = ResetRequest()) -> SchedulerObservation:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/step", response_model=StepResult)
-async def step(action: SchedulerAction) -> StepResult:
+@app.post("/step")
+async def step(body: dict) -> dict:
     """
     Execute one agent action.
 
-    Action is either:
-      - {"action_type": "assign", "task_id": "...", "worker_id": N}
-      - {"action_type": "wait"}
+    Accepts two formats:
+      1. Direct: {"action_type": "assign", "task_id": "...", "worker_id": N}
+      2. SDK-wrapped: {"action": {"action_type": "...", ...}, "timeout_s": 15}
 
     Returns observation, reward (0.0 during play, final score at end),
     and done flag.
@@ -109,9 +109,16 @@ async def step(action: SchedulerAction) -> StepResult:
     Invalid actions return normally with last_action_valid=False and
     an explanatory message — they do NOT crash or return 400.
     """
+    # Handle openenv SDK format: {"action": {...}, "timeout_s": N}
+    if "action" in body:
+        action_data = body["action"]
+    else:
+        action_data = body
+
     try:
+        action = SchedulerAction(**action_data)
         result = env.step(action)
-        return result
+        return result.model_dump()
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

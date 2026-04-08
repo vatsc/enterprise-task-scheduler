@@ -1,74 +1,125 @@
 """
-Baseline Inference Script — Enterprise Task Dependency Scheduler
-=================================================================
-This script plays the environment using an OpenAI-compatible LLM agent.
-It connects to the running server, plays all 3 difficulty levels, and
-reports scores.
+Inference Script — Enterprise Task Dependency Scheduler
+=========================================================
+MANDATORY
+- Before submitting, ensure the following variables are defined in your environment configuration:
+    API_BASE_URL   The API endpoint for the LLM.
+    MODEL_NAME     The model identifier to use for inference.
+    HF_TOKEN       Your Hugging Face / API key.
+    LOCAL_IMAGE_NAME The name of the local image to use for the environment if you are using from_docker_image()
 
-Usage:
-    # Start the server first:
-    python3 -m uvicorn server.app:app --port 8000
+- Defaults are set only for API_BASE_URL and MODEL_NAME
+    API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+    MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
-    # Then run the agent:
-    export OPENAI_API_KEY="your-key-here"
-    python3 inference.py
+- The inference script must be named `inference.py` and placed in the root directory of the project
+- Participants must use OpenAI Client for all LLM calls using above variables
 
-    # Or with a custom server URL:
-    python3 inference.py --base-url http://localhost:8000
+STDOUT FORMAT
+- The script must emit exactly three line types to stdout, in this order:
 
-    # Run without LLM (uses greedy heuristic as fallback):
-    python3 inference.py --no-llm
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+
+  Rules:
+    - One [START] line at episode begin.
+    - One [STEP] line per step, immediately after env.step() returns.
+    - One [END] line after env.close(), always emitted (even on exception).
+    - reward and rewards are formatted to 2 decimal places.
+    - done and success are lowercase booleans: true or false.
+    - error is the raw last_action_error string, or null if none.
+    - All fields on a single line with no newlines within a line.
+    - Each tasks should return score in [0, 1]
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
-import time
+import textwrap
+from typing import List, Optional
 
-import httpx
+from openai import OpenAI
 
 # ─────────────────────────────────────────────────────────────
-# LLM Agent — uses OpenAI API to make scheduling decisions
+# Environment Variables (mandatory for hackathon)
 # ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """\
-You are an expert task scheduler for a high-performance computing cluster.
+IMAGE_NAME = os.getenv("IMAGE_NAME", "enterprise-task-scheduler")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
-Your goal is to schedule dependent tasks across multiple workers to MINIMIZE
-total execution time (makespan). You will be shown the current state of the
-scheduler and must decide what to do next.
+BENCHMARK = "enterprise-task-scheduler"
+TASKS = ["easy", "medium", "hard"]
+MAX_STEPS = 100
+TEMPERATURE = 0.1
+MAX_TOKENS = 150
 
-RULES:
-1. You can ASSIGN a task to a worker: {"action_type": "assign", "task_id": "...", "worker_id": N}
-2. You can WAIT for running tasks to finish: {"action_type": "wait"}
-3. You can only assign tasks whose dependencies are ALL completed (shown in ready_tasks).
-4. You can only assign to idle workers (shown in idle_workers).
-5. CRITICAL STRATEGY: Always prioritize tasks with the LONGEST remaining
-   critical path. Tasks that take longer and have more downstream dependents
-   should be started FIRST. This minimizes the total makespan.
+# ─────────────────────────────────────────────────────────────
+# Structured stdout logging (mandatory format)
+# ─────────────────────────────────────────────────────────────
 
-Respond with ONLY a valid JSON action. No explanation, no markdown, just JSON.
-"""
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# LLM-based scheduling agent (uses OpenAI client)
+# ─────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = textwrap.dedent("""\
+    You are an expert task scheduler for a high-performance computing cluster.
+
+    Your goal is to schedule dependent tasks across multiple workers to MINIMIZE
+    total execution time (makespan). You will be shown the current state of the
+    scheduler and must decide what to do next.
+
+    RULES:
+    1. You can ASSIGN a task to a worker: {"action_type": "assign", "task_id": "...", "worker_id": N}
+    2. You can WAIT for running tasks to finish: {"action_type": "wait"}
+    3. You can only assign tasks whose dependencies are ALL completed (shown in ready_tasks).
+    4. You can only assign to idle workers (shown in idle_workers).
+    5. CRITICAL STRATEGY: Always prioritize tasks with the LONGEST remaining
+       critical path. Tasks that take longer and have more downstream dependents
+       should be started FIRST. This minimizes the total makespan.
+
+    Respond with ONLY a valid JSON action. No explanation, no markdown, just JSON.
+""")
 
 
 def build_user_prompt(obs: dict) -> str:
     """Build a concise prompt from the observation."""
-    ready = obs["ready_tasks"]
-    idle = obs["idle_workers"]
-    running = obs["running_tasks"]
-    completed = obs["completed_tasks"]
-    all_tasks = obs["all_tasks"]
+    ready = obs.get("ready_tasks", [])
+    idle = obs.get("idle_workers", [])
+    running = obs.get("running_tasks", {})
+    completed = obs.get("completed_tasks", [])
+    all_tasks = obs.get("all_tasks", [])
 
-    # Build dependency chains for context
-    task_info = {}
-    for t in all_tasks:
-        task_info[t["task_id"]] = t
+    task_info = {t["task_id"]: t for t in all_tasks}
 
     lines = [
-        f"Current time: t={obs['current_time']}",
+        f"Current time: t={obs.get('current_time', 0)}",
         f"Completed: {completed}",
         f"Running: {running}",
         f"Idle workers: {idle}",
@@ -76,26 +127,17 @@ def build_user_prompt(obs: dict) -> str:
         "Ready tasks (can be assigned NOW):",
     ]
     for t in ready:
-        # Count downstream dependents
         dependents = [
             at["task_id"] for at in all_tasks
-            if t["task_id"] in at["dependencies"]
+            if t["task_id"] in at.get("dependencies", [])
         ]
         lines.append(
             f"  - {t['task_id']}: duration={t['duration']}, "
-            f"deps={t['dependencies']}, downstream={dependents}"
+            f"deps={t.get('dependencies', [])}, downstream={dependents}"
         )
 
     if not ready:
         lines.append("  (none — you must WAIT)")
-
-    lines.append("")
-    lines.append("Pending tasks (not yet ready):")
-    for tid in obs["pending_tasks"]:
-        if tid in [t["task_id"] for t in ready]:
-            continue
-        t = task_info.get(tid, {})
-        lines.append(f"  - {tid}: duration={t.get('duration','?')}, deps={t.get('dependencies','?')}")
 
     lines.append("")
     if ready and idle:
@@ -106,53 +148,75 @@ def build_user_prompt(obs: dict) -> str:
     return "\n".join(lines)
 
 
-def call_llm(system: str, user: str, api_key: str, model: str = "gpt-4o-mini") -> dict:
-    """Call OpenAI API and parse the JSON response."""
-    client = httpx.Client(timeout=30)
-    resp = client.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
+def get_llm_action(client: OpenAI, obs: dict) -> Optional[dict]:
+    """Ask the LLM to decide the next action. Returns None on failure."""
+    user_prompt = build_user_prompt(obs)
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.0,
-            "max_tokens": 100,
-        },
-    )
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"].strip()
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            stream=False,
+        )
+        text = (completion.choices[0].message.content or "").strip()
 
-    # Strip markdown code fences if present
-    if content.startswith("```"):
-        content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
 
-    return json.loads(content)
-
-
-# ─────────────────────────────────────────────────────────────
-# Greedy Heuristic Agent — fallback when no LLM key is set
-# ─────────────────────────────────────────────────────────────
+        return json.loads(text)
+    except Exception as exc:
+        print(f"[DEBUG] LLM error: {exc}", flush=True)
+        return None
 
 
 def greedy_action(obs: dict) -> dict:
     """
-    Simple heuristic: assign the LONGEST-duration ready task to the
-    first idle worker. This approximates critical-path scheduling.
+    Critical-path heuristic: assign the task with the longest downstream
+    critical path to the first idle worker. This matches the optimal solver.
     """
-    ready = obs["ready_tasks"]
-    idle = obs["idle_workers"]
+    ready = obs.get("ready_tasks", [])
+    idle = obs.get("idle_workers", [])
 
     if not ready or not idle:
         return {"action_type": "wait"}
 
-    # Sort by duration descending (longest first = critical path heuristic)
-    ready_sorted = sorted(ready, key=lambda t: -t["duration"])
+    # Build dependency graph for critical path calculation
+    all_tasks = obs.get("all_tasks", [])
+    task_map = {t["task_id"]: t for t in all_tasks}
+
+    # Compute longest path from each task to the end (memoized)
+    cache = {}
+
+    def critical_path_length(task_id: str) -> int:
+        if task_id in cache:
+            return cache[task_id]
+        t = task_map.get(task_id)
+        if t is None:
+            return 0
+        # Find all tasks that depend on this task (downstream)
+        downstream = [
+            at["task_id"] for at in all_tasks
+            if task_id in at.get("dependencies", [])
+        ]
+        if not downstream:
+            result = t["duration"]
+        else:
+            result = t["duration"] + max(
+                critical_path_length(d) for d in downstream
+            )
+        cache[task_id] = result
+        return result
+
+    # Sort ready tasks by critical path length (longest first)
+    ready_sorted = sorted(ready, key=lambda t: -critical_path_length(t["task_id"]))
     return {
         "action_type": "assign",
         "task_id": ready_sorted[0]["task_id"],
@@ -161,165 +225,189 @@ def greedy_action(obs: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# Episode Runner
+# Episode runner
 # ─────────────────────────────────────────────────────────────
 
 
-def play_episode(
-    base_url: str,
-    task_name: str,
-    seed: int,
-    use_llm: bool = False,
-    api_key: str = "",
-    model: str = "gpt-4o-mini",
-    verbose: bool = True,
-) -> dict:
-    """Play one full episode and return the grader results."""
-    client = httpx.Client(base_url=base_url, timeout=30)
-
-    # Reset
-    obs = client.post("/reset", json={"task_name": task_name, "seed": seed}).json()
-
-    if verbose:
-        print(f"\n  {'─' * 50}")
-        print(f"  Episode: {task_name} (seed={seed})")
-        print(f"  Tasks: {len(obs['all_tasks'])} | Workers: {obs['num_workers']}")
-        print(f"  {'─' * 50}")
-
-    steps = 0
-    max_steps = 200
-    result = None
-
-    while not obs["is_done"] and steps < max_steps:
-        # Decide action
-        if use_llm and api_key:
-            try:
-                user_prompt = build_user_prompt(obs)
-                action = call_llm(SYSTEM_PROMPT, user_prompt, api_key, model)
-            except Exception as e:
-                if verbose:
-                    print(f"  ⚠️  LLM error: {e}, falling back to greedy")
-                action = greedy_action(obs)
-        else:
-            action = greedy_action(obs)
-
-        # Step
-        resp = client.post("/step", json=action)
-        result = resp.json()
-        obs = result["observation"]
-        steps += 1
-
-        if verbose and not obs["last_action_valid"]:
-            print(f"  ⚠️  Step {steps}: Invalid action — {obs['message']}")
-            # Retry with greedy on invalid action
-            action = greedy_action(obs)
-            resp = client.post("/step", json=action)
-            result = resp.json()
-            obs = result["observation"]
-            steps += 1
-
-        if result["done"]:
-            break
-
-    # Get grader info
-    grader = client.get("/grader").json()
-
-    if verbose:
-        print(f"  ✅ Done in {steps} steps")
-        print(f"  Score: {grader['score']:.3f} "
-              f"(agent={grader['agent_makespan']}, optimal={grader['optimal_makespan']})")
-
-    return {
-        "task_name": task_name,
-        "seed": seed,
-        "steps": steps,
-        "score": grader["score"],
-        "agent_makespan": grader["agent_makespan"],
-        "optimal_makespan": grader["optimal_makespan"],
-    }
+def obs_to_dict(obs) -> dict:
+    """Convert observation to dict, handling both dict and object forms."""
+    if isinstance(obs, dict):
+        return obs
+    if hasattr(obs, "to_dict"):
+        return obs.to_dict()
+    if hasattr(obs, "_data"):
+        return obs._data
+    return vars(obs)
 
 
-# ─────────────────────────────────────────────────────────────
-# Main — Run baseline across all difficulties
-# ─────────────────────────────────────────────────────────────
+def action_to_str(action: dict) -> str:
+    """Format action as a compact string for the [STEP] log."""
+    if action.get("action_type") == "assign":
+        return f"assign({action.get('task_id')},{action.get('worker_id')})"
+    return "wait()"
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Baseline agent for Enterprise Task Scheduler"
-    )
-    parser.add_argument(
-        "--base-url", default="http://127.0.0.1:8000",
-        help="Server URL (default: http://127.0.0.1:8000)"
-    )
-    parser.add_argument(
-        "--no-llm", action="store_true",
-        help="Use greedy heuristic instead of LLM"
-    )
-    parser.add_argument(
-        "--model", default="gpt-4o-mini",
-        help="OpenAI model to use (default: gpt-4o-mini)"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for episodes (default: 42)"
-    )
-    parser.add_argument(
-        "--tasks", nargs="+", default=["easy", "medium", "hard"],
-        help="Difficulties to test (default: easy medium hard)"
-    )
-    args = parser.parse_args()
+def play_episode(env, task_name: str, llm_client: Optional[OpenAI] = None) -> float:
+    """
+    Play one full episode with structured logging.
+    Returns the final score in [0.0, 1.0].
+    """
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
 
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    use_llm = not args.no_llm and bool(api_key)
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
-    agent_type = f"LLM ({args.model})" if use_llm else "Greedy Heuristic"
-
-    print("╔═══════════════════════════════════════════════════════════╗")
-    print("║  Enterprise Task Scheduler — Baseline Agent              ║")
-    print(f"║  Agent: {agent_type:<48s}║")
-    print("╚═══════════════════════════════════════════════════════════╝")
-
-    if not use_llm and not args.no_llm:
-        print("\n  ℹ️  No OPENAI_API_KEY set. Using greedy heuristic.")
-        print("  Set OPENAI_API_KEY or use --no-llm to suppress this message.\n")
-
-    # Check server is running
     try:
-        r = httpx.get(f"{args.base_url}/health", timeout=5)
-        assert r.status_code == 200
-    except Exception:
-        print(f"\n  ❌ Cannot reach server at {args.base_url}")
-        print("  Start it first: python3 -m uvicorn server.app:app --port 8000")
-        sys.exit(1)
+        # Reset with specific task name
+        result = env.reset_with_task(task_name=task_name)
+        obs = obs_to_dict(result.observation)
 
-    # Play all difficulties
-    results = []
-    for task_name in args.tasks:
-        result = play_episode(
-            base_url=args.base_url,
-            task_name=task_name,
-            seed=args.seed,
-            use_llm=use_llm,
-            api_key=api_key,
-            model=args.model,
-        )
-        results.append(result)
+        for step_idx in range(1, MAX_STEPS + 1):
+            if result.done:
+                break
 
-    # Summary table
-    print(f"\n  {'═' * 55}")
-    print(f"  {'Task':<10} {'Score':>8} {'Agent':>8} {'Optimal':>8} {'Steps':>8}")
-    print(f"  {'─' * 55}")
-    for r in results:
-        print(f"  {r['task_name']:<10} {r['score']:>8.3f} {r['agent_makespan']:>8} "
-              f"{r['optimal_makespan']:>8} {r['steps']:>8}")
-    avg = sum(r["score"] for r in results) / len(results)
-    print(f"  {'─' * 55}")
-    print(f"  {'AVERAGE':<10} {avg:>8.3f}")
-    print(f"  {'═' * 55}")
+            # Decide action: try LLM first, fallback to greedy
+            action = None
+            if llm_client is not None:
+                action = get_llm_action(llm_client, obs)
 
-    # Return results as JSON for the /baseline endpoint integration
-    return results
+            if action is None:
+                action = greedy_action(obs)
+
+            # Step
+            result = env.step(action)
+            obs = obs_to_dict(result.observation)
+
+            reward = result.reward if result.reward is not None else 0.0
+            done = result.done
+            error = None
+
+            # Check for invalid action
+            if not obs.get("last_action_valid", True):
+                error = obs.get("message", "invalid action")
+                # Retry with greedy on invalid action
+                fallback = greedy_action(obs)
+                result = env.step(fallback)
+                obs = obs_to_dict(result.observation)
+                reward = result.reward if result.reward is not None else 0.0
+                done = result.done
+                action = fallback
+                error = None  # recovered
+
+            rewards.append(reward)
+            steps_taken = step_idx
+
+            log_step(
+                step=step_idx,
+                action=action_to_str(action),
+                reward=reward,
+                done=done,
+                error=error,
+            )
+
+            if done:
+                break
+
+        # Get final score from grader
+        grader = env.get_grader()
+        score = grader.get("score", 0.0)
+        score = min(max(score, 0.0), 1.0)
+        success = score > 0.0
+
+    except Exception as exc:
+        print(f"[DEBUG] Episode error: {exc}", flush=True)
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    return score
+
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    # Initialize OpenAI client
+    llm_client = None
+    if API_KEY:
+        llm_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    else:
+        print("[DEBUG] No HF_TOKEN/API_KEY set, using greedy heuristic only.", flush=True)
+
+    # Try to use openenv SDK with from_docker_image
+    env = None
+    try:
+        from scheduler_client import SchedulerEnvClient
+
+        if os.getenv("ENV_BASE_URL"):
+            # Direct URL mode (for testing against a running server)
+            env = SchedulerEnvClient(os.getenv("ENV_BASE_URL"))
+        else:
+            # Docker mode (standard hackathon evaluation)
+            env = SchedulerEnvClient.from_docker_image(IMAGE_NAME)
+    except Exception as exc:
+        print(f"[DEBUG] SDK init failed: {exc}. Falling back to direct HTTP.", flush=True)
+        # Fallback: direct HTTP for local testing
+        import httpx
+
+        class DirectHTTPEnv:
+            """Minimal env wrapper using direct HTTP calls (fallback)."""
+            def __init__(self, base_url: str):
+                self._client = httpx.Client(base_url=base_url, timeout=30)
+
+            def reset_with_task(self, task_name="easy", seed=None):
+                body = {"task_name": task_name}
+                if seed is not None:
+                    body["seed"] = seed
+                r = self._client.post("/reset", json=body)
+                r.raise_for_status()
+                obs = r.json()
+
+                class _Result:
+                    def __init__(self, obs_dict):
+                        self.observation = obs_dict
+                        self.reward = 0.0
+                        self.done = False
+                return _Result(obs)
+
+            def step(self, action):
+                r = self._client.post("/step", json=action)
+                r.raise_for_status()
+                data = r.json()
+
+                class _Result:
+                    def __init__(self, d):
+                        self.observation = d.get("observation", d)
+                        self.reward = d.get("reward", 0.0)
+                        self.done = d.get("done", False)
+                return _Result(data)
+
+            def get_grader(self):
+                r = self._client.get("/grader")
+                r.raise_for_status()
+                return r.json()
+
+            def close(self):
+                self._client.close()
+
+        base = os.getenv("ENV_BASE_URL", "http://127.0.0.1:7860")
+        env = DirectHTTPEnv(base)
+
+    # Play all tasks
+    try:
+        scores = []
+        for task_name in TASKS:
+            score = play_episode(env, task_name, llm_client)
+            scores.append(score)
+    finally:
+        try:
+            env.close()
+        except Exception as e:
+            print(f"[DEBUG] env.close() error: {e}", flush=True)
 
 
 if __name__ == "__main__":
