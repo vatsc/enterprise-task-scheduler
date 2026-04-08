@@ -233,3 +233,19 @@ async def tasks() -> TasksResponse:
 async def health():
     """Simple health check endpoint."""
     return {"status": "ok", "environment": "enterprise-task-scheduler"}
+
+
+# ─────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────
+
+
+def main():
+    """Run the server. Used as the [project.scripts] entry point."""
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
+
+
+if __name__ == "__main__":
+    main()
+
