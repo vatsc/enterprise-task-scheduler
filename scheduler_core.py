@@ -472,8 +472,11 @@ def grade_episode(agent_makespan: int, optimal_makespan: int) -> float:
     Perfect play → 1.0. Twice as slow → 0.5.
     """
     if agent_makespan <= 0:
-        return 0.0
-    return max(0.0, min(1.0, optimal_makespan / agent_makespan))
+        return 0.001
+    
+    raw_score = optimal_makespan / agent_makespan
+    # Phase 2 validator strictly requires score in (0, 1), not 0.0 and not 1.0
+    return max(0.001, min(0.999, raw_score))
 
 
 # ─────────────────────────────────────────────────────────────
