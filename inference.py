@@ -47,7 +47,7 @@ from openai import OpenAI
 # Environment Variables (mandatory for hackathon)
 # ─────────────────────────────────────────────────────────────
 
-IMAGE_NAME = os.getenv("IMAGE_NAME", "enterprise-task-scheduler")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "enterprise-task-scheduler")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -348,7 +348,7 @@ def main() -> None:
             env = SchedulerEnvClient(os.getenv("ENV_BASE_URL"))
         else:
             # Docker mode (standard hackathon evaluation)
-            env = SchedulerEnvClient.from_docker_image(IMAGE_NAME)
+            env = SchedulerEnvClient.from_docker_image(LOCAL_IMAGE_NAME)
     except Exception as exc:
         print(f"[DEBUG] SDK init failed: {exc}. Falling back to direct HTTP.", flush=True)
         # Fallback: direct HTTP for local testing
